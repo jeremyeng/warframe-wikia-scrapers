@@ -4,14 +4,15 @@ const axios = require('axios');
 const cmd = require('node-cmd');
 const fs = require('fs-extra');
 const cheerio = require('cheerio');
+const _ = require('lodash');
 
 const transformWeapon = require('./transformers/transformWeapon');
 
-let imageUrls;
-
-const getLuaWeaponData = async () => {
+const getLuaData = async category => {
   try {
-    const { data } = await axios.get('http://warframe.wikia.com/wiki/Module:Weapons/data?action=edit');
+    const { data } = await axios.get(
+      `http://warframe.wikia.com/wiki/Module:${category}/data?action=edit`
+    );
     const $ = cheerio.load(data);
     return $('#wpTextbox1').text();
   } catch (err) {
@@ -21,8 +22,9 @@ const getLuaWeaponData = async () => {
   }
 };
 
-const convertWeaponDataToJson = async (luaWeapondata) => {
-  const scriptlines = luaWeapondata.split('\n');
+const convertdataToJSON = async luaData => {
+  const scriptlines = luaData.split('\n');
+  const dataCategory = luaData.match(/(\w+)Data/)[0];
 
   // Remove return statement
   const modifiedScript = scriptlines
@@ -33,39 +35,44 @@ const convertWeaponDataToJson = async (luaWeapondata) => {
   const luaToJsonScript = `
     JSON = (loadfile "JSON.lua")()\n
     ${modifiedScript}\n
-    print(JSON:encode(WeaponData))
-  `;
+    print(JSON:encode(${dataCategory}))
+    `;
 
   // Run updated JSON lua script
-  if (!await fs.exists('./tmp')) {
+  if (!(await fs.exists('./tmp'))) {
     await fs.mkdir('./tmp');
   }
-  await fs.writeFile('./tmp/weapondataToJson.lua', luaToJsonScript, {
+  await fs.writeFile(`./tmp/${dataCategory}ToJson.lua`, luaToJsonScript, {
     encoding: 'utf8',
-    flag: 'w',
+    flag: 'w'
   });
 
   try {
-    await new Promise((resolve, reject) => cmd.get('lua ./tmp/weapondataToJson.lua > ./tmp/weapondataraw.json', (err) => {
-      if (!err) {
-        resolve();
-      } else {
-        reject(err);
-        throw (new Error(err));
-      }
-    }));
+    await new Promise((resolve, reject) =>
+      cmd.get(
+        `lua ./tmp/${dataCategory}ToJson.lua > ./tmp/${dataCategory}Raw.json`,
+        err => {
+          if (!err) {
+            resolve();
+          } else {
+            reject(err);
+            throw new Error(err);
+          }
+        }
+      )
+    );
   } catch (err) {
     console.error('Failed to execute modified lua script:');
     console.error(err);
   }
-  const weapondataRaw = await fs.readFile('./tmp/weapondataraw.json', 'UTF-8');
-  return weapondataRaw;
+  const rawData = await fs.readFile(`./tmp/${dataCategory}Raw.json`, 'UTF-8');
+  return rawData;
 };
 
-const getWeaponImageUrls = async (weapons) => {
+const getImageURLs = async category => {
   const titles = [];
-  Object.keys(weapons).forEach((weaponName) => {
-    titles.push(`File:${weapons[weaponName].Image}`);
+  Object.keys(category).forEach(name => {
+    titles.push(`File:${category[name].Image}`);
   });
 
   // Split titles into batches of 50, the max allowed by the wikimedia API
@@ -81,15 +88,16 @@ const getWeaponImageUrls = async (weapons) => {
         titles: titleBatch.join('|'),
         prop: 'imageinfo',
         iiprop: 'url',
-        format: 'json',
-      },
-    }));
+        format: 'json'
+      }
+    })
+  );
 
   try {
-    const fetchedImageUrls = await Promise.all(urlRequests).then((res) => {
+    const fetchedImageUrls = await Promise.all(urlRequests).then(res => {
       const urls = {};
       res.forEach(({ data }) => {
-        Object.keys(data.query.pages).forEach((id) => {
+        Object.keys(data.query.pages).forEach(id => {
           if (id > -1) {
             const title = data.query.pages[id].title.replace('File:', '');
             const { url } = data.query.pages[id].imageinfo[0];
@@ -108,26 +116,40 @@ const getWeaponImageUrls = async (weapons) => {
   }
 };
 
+const replaceImageURLs = (data, imageUrls) => {
+  return _.mapValues(data, value => {
+    const { Image, ...rest } = value;
+    if (imageUrls[Image]) {
+      const newImageURL = imageUrls[Image];
+      return { Image: newImageURL, ...rest };
+    } else {
+      return value;
+    }
+  });
+};
+
+// Category is either "Warframes", "Weapons", "Mods"
+const buildJSON = async category => {
+  const luaData = await getLuaData(category);
+  const rawData = JSON.parse(await convertdataToJSON(luaData));
+  const imageUrls = await getImageURLs(rawData[category]);
+  const dataWithFixedImageURLs = replaceImageURLs(rawData[category], imageUrls);
+  return dataWithFixedImageURLs;
+};
+
 async function main() {
-  const luaWeapondata = await getLuaWeaponData();
-  const weapondata = JSON.parse(await convertWeaponDataToJson(luaWeapondata));
+  const [warframeData, weaponData, modData] = await Promise.all([
+    buildJSON('Warframes'),
+    buildJSON('Weapons'),
+    buildJSON('Mods')
+  ]);
 
-  imageUrls = await getWeaponImageUrls(weapondata.Weapons);
-
-  let weapons = [];
-  try {
-    weapons = Object.keys(weapondata.Weapons).map(weaponName =>
-    transformWeapon(weapondata.Weapons[weaponName], imageUrls))
-    .filter(weapon => typeof weapon !== 'undefined');  
-  } catch (e) {
-    console.error(e);
-  }
-  
-
-  if (!await fs.exists('./build')) {
+  if (!(await fs.exists('./build'))) {
     await fs.mkdir('./build');
   }
-  fs.writeFile('./build/weapondatafinal.json', JSON.stringify(weapons));
+  fs.writeFile('./build/warframeDataFinal.json', JSON.stringify(warframeData));
+  fs.writeFile('./build/weaponDataFinal.json', JSON.stringify(weaponData));
+  fs.writeFile('./build/modDataFinal.json', JSON.stringify(modData));
   fs.remove('./tmp');
 }
 
